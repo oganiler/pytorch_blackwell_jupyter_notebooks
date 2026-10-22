@@ -21,7 +21,7 @@ num_envs = 1
 total_timesteps = 100_000
 
 # adam learning rate
-learning_rate = 1e-3
+learning_rate = 2e-3
 
 # discount factor
 gamma = 0.99
@@ -31,6 +31,37 @@ eps = 0.1
 
 # seed for reproducibility
 seed = None
+
+# number of transitions to store in replay buffer
+buffer_size = 10_000
+
+# target network update constant - Polyak Averaging
+# θ_target = τ * θ_online + (1 - τ) * θ_target
+tau = 1.0
+
+# number of timesteps between target network updates
+target_network_frequency = 50
+
+# size of sample from teplay buffer
+batch_size = 32
+
+# initial value of epsilon (%100 exploration)
+start_eps = 1
+
+# final value of epsilon (%1 exploration)
+end_eps = 0.01
+
+# number of steps to decrease from start_eps to end_eps
+# currently %10 of the total (also equals to buffer_size, by coincedence)
+exploration_duration = int(0.1 * total_timesteps)
+
+# number of steps before beginning training
+# we are not even going to wait to be full (5000 < buffer_size)
+num_steps_before_training = 5_000
+
+# number of steps between each gradient descent step
+# sample a batch from the replay buffer and then train on that
+train_frequency = 4 # times interactions with the environment
 
 video_path = "qlearning_cartpole_videos"
 
@@ -70,8 +101,18 @@ class QNetwork(nn.Module):
     def forward(self, state_x):
         return self.network(state_x)
 
-def np2torch(a):
-    return torch.Tensor(a).float().to(device)
+def np2torch(a, to_float=True):
+    if to_float:
+        dtype = torch.float32
+    else:
+        dtype = torch.int64
+
+    return torch.as_tensor(a, dtype=dtype, device=device)
+
+# %%
+def linear_schedule(start_eps, end_eps, duration, t):
+    slope = (end_eps - start_eps) / duration
+    return max(slope*t + start_eps, end_eps)
 
 # %%
 # make environaments
@@ -80,11 +121,47 @@ envs = gym.vector.SyncVectorEnv(
         lambda i=i: make_env(
             env_id,
             False,
-            seed=None if seed is None else seed + 1000,
+            seed=None if seed is None else seed + i*10,
         )
         for i in range(num_envs)
     ]
 )
+
+# %%
+
+class ReplayBuffer:
+    def __init__(self, obs_dim, size):
+        if obs_dim is None:
+            obs_dim = 1
+            
+        self.obs1_buf = np.zeros([size, obs_dim], dtype=np.float32)
+        self.obs2_buf = np.zeros([size, obs_dim], dtype=np.float32)
+        self.acts_buf = np.zeros(size, dtype=np.uint8)
+        self.rews_buf = np.zeros(size, dtype=np.float32)
+        self.done_buf = np.zeros(size, dtype=np.uint8)
+        self.ptr, self.size, self.max_size = 0, 0, size
+
+    def store(self, obs, act, rew, next_obs, done):
+        self.obs1_buf[self.ptr] = obs
+        self.obs2_buf[self.ptr] = next_obs
+        self.acts_buf[self.ptr] = act
+        self.rews_buf[self.ptr] = rew
+        self.done_buf[self.ptr] = done
+
+        self.ptr = (self.ptr + 1) % self.max_size
+        self.size = min(self.size + 1, self.max_size)
+
+    def sample_batch(self, batch_size=32):
+        idxs = np.random.randint(0, self.size, size=batch_size)
+
+        return dict(
+            s=self.obs1_buf[idxs],
+            s2=self.obs2_buf[idxs],
+            a=self.acts_buf[idxs],
+            r=self.rews_buf[idxs],
+            d=self.done_buf[idxs]
+        )
+
 
 # %%
 episode_returns = []
@@ -92,19 +169,29 @@ losses = []
 current_state_obs, _ = envs.reset(seed=seed) # States [B, 4] [B=1, [Cart position, Cart velocity, Pole angle, Pole angular velocity]]
 auto_reset = np.zeros(num_envs, dtype = bool)
 
-# NN to GPU
+# Online Q-Network
 q_network = QNetwork(envs).to(device) # state --> NN --> Q(s,a), where predicted_value = Q(s,a).max() and predicted_action = arg_max(Q(s,a))
+
+# Target Q-Network
+target_network = QNetwork(envs).to(device)
+target_network.load_state_dict(q_network.state_dict()) # copy main to target
+
 optimizer = opt.Adam(q_network.parameters(), lr=learning_rate)
+
+rb = ReplayBuffer(envs.single_observation_space.shape[0], buffer_size)
 
 start_time = time.time()
 for global_step in range(total_timesteps):
     
     #select action(s) by epsilon-greedy method
-    if random.random() < eps:
+    # decrease epsilon over time to explore less exploit more
+    epsilon = linear_schedule(start_eps, end_eps, exploration_duration, global_step)
+
+    if random.random() < epsilon:
         actions = np.array([envs.single_action_space.sample() for _ in range(num_envs)])
     else:
         # select best actions by arg_max from NN (Q(s,a))
-        q_values = q_network(np2torch(current_state_obs)) # to be optimized by NN
+        q_values = q_network(np2torch(current_state_obs))
         actions = torch.argmax(q_values, dim=1).cpu().numpy() # predicted_actions = arg_max(Q(s,a))
 
     # get s', R, done - take a step in the environment
@@ -117,47 +204,11 @@ for global_step in range(total_timesteps):
             episode_returns.append(ret)
             print(f"global_step = {global_step}, episode = {len(episode_returns)}, episode_return = {ret}")
 
-    # training
-
-    # use only envs that haven't been autoreset
-    auto_reset_mask = np.logical_not(auto_reset)
-    # calculate the target = R + γ * (max(Q(s', a')))
-    if(np.any(auto_reset_mask)):
-
-        # masked with the not resetted
-        next_state_obs_masked = next_state_obs[auto_reset_mask]
-        current_state_obs_masked = current_state_obs[auto_reset_mask]
-        actions_masked = actions[auto_reset_mask]
-        rewards_masked = rewards[auto_reset_mask]
-        dones_masked = terminateds[auto_reset_mask] | truncateds[auto_reset_mask]
-
-        with torch.no_grad():
-            # get the next max(Q(s', a'))
-            next_max_q_values = torch.max(q_network(np2torch(next_state_obs_masked)), dim=1).values
-            # Bellman: Q(s,a) = Q(s,a) + α * (R + γ * (max(Q(s', a'))) - Q(s,a))  --> ( Q(s,a) = Q(s,a) + α * (target - Q(s,a)))
-            target = np2torch(rewards_masked) + gamma * (1 - np2torch(dones_masked)) * next_max_q_values
-
-        # prediction: forward by masked Q(s) and get the values Q(s,a) for the actions performed (gather)
-        q_values_masked = q_network(np2torch(current_state_obs_masked)) # [B, 2 (left, right)]
-        # gather() selects the Q-value of the action actually performed, not the action with the maximum Q-value. 
-        # This is exactly what we want when computing the prediction term (Q(s,a) in the loss function
-        q_values_performed = torch.gather(
-            input=q_values_masked, 
-            dim=1, 
-            index = torch.from_numpy(actions_masked.reshape(-1,1)).to(device)
-            ) # [B, 1]
-
-        #prepare the dimensions for the loss function
-        q_values_predictions = q_values_performed.squeeze(1)  # [B]
-
-        loss = F.mse_loss(q_values_predictions, target)
-        losses.append(loss.detach().cpu().numpy())
-
-        # optimize
-        optimizer.zero_grad()
-        loss.backward()
-        # update
-        optimizer.step()
+    # update replay buffer
+    # every episode that hasn't ended essentially we should add this transition to the replay buffer.
+    for i in range(num_envs):
+        if not auto_reset[i]:
+            rb.store(current_state_obs[i], actions[i], rewards[i], next_state_obs[i], terminateds[i])
 
     # go to the next state
     current_state_obs = next_state_obs
@@ -165,13 +216,62 @@ for global_step in range(total_timesteps):
     # update auto reset
     auto_reset = np.logical_or(terminateds, truncateds)
 
-    if global_step % 1000 == 0:
-        print("steps per second:", int(global_step / (time.time() - start_time)))
+    # training
+    #   We're not training on every step.
+    #   We're taking the first few steps to add samples to the replay buffer and just perform random actions
 
-    # let's brek if the last 10 episodes had max reward
-    if(len(episode_returns)) > 10 and np.all(np.equal(episode_returns[-10:], 500)):
-        print("max reward achieved")
-        break
+    if global_step > num_steps_before_training:
+        if global_step % train_frequency == 0:
+
+            # get sample batch from the replay buffer
+            batch = rb.sample_batch(batch_size)
+
+            with torch.no_grad():
+                replay_next_state_obs = np2torch(batch["s2"])
+                replay_rewards = np2torch(batch["r"].flatten())
+                # get the next max(Q(s', a'))
+                replay_next_max_q_values = target_network(replay_next_state_obs).max(dim=1).values
+                # Bellman: Q(s,a) = Q(s,a) + α * (R + γ * (max(Q(s', a'))) - Q(s,a))  --> ( Q(s,a) = Q(s,a) + α * (target - Q(s,a)))
+                replay_target = replay_rewards + gamma * (1 - np2torch(batch["d"].flatten())) * replay_next_max_q_values
+
+            replay_actions = np2torch(batch["a"], to_float=False)
+            replay_current_state_obs = np2torch(batch["s"])
+
+            # prediction: forward by masked Q(s) and get the values Q(s,a) for the actions performed (gather)
+            current_replay_q_values = q_network(np2torch(replay_current_state_obs)) # [B, 2 (left, right)]
+
+            # gather() selects the Q-value of the action actually performed, not the action with the maximum Q-value. 
+            # This is exactly what we want when computing the prediction term (Q(s,a) in the loss function
+            replay_q_values_performed = torch.gather(
+                                        input=current_replay_q_values, 
+                                        dim=1, 
+                                        index = replay_actions.reshape(-1,1)
+                                        ) # [B, 1]            
+
+            #prepare the dimensions for the loss function
+            replay_q_values_predictions = replay_q_values_performed.squeeze(1)  # [B]
+
+            loss = F.mse_loss(replay_q_values_predictions, replay_target)
+            losses.append(loss.detach().cpu().numpy())
+
+            # optimize
+            optimizer.zero_grad()
+            loss.backward()
+            # update
+            optimizer.step()            
+
+        if global_step % 1000 == 0:
+            print("steps per second:", int(global_step / (time.time() - start_time)))
+
+        # update the target network
+        if global_step % target_network_frequency == 0:
+            for target_network_param, q_network_param in zip(target_network.parameters(), q_network.parameters()):
+                target_network_param.data.copy_(tau * q_network_param.data + (1.0 - tau) * target_network_param.data)
+
+        # let's brek if the last 10 episodes had max reward
+        if(len(episode_returns)) > 10 and np.all(np.equal(episode_returns[-10:], 500)):
+            print("max reward achieved")
+            break
 
 envs.close()   
 
@@ -196,7 +296,7 @@ plt.show()
 
 # %%
 # save model
-model_path = "/workspace/repos/jupyter_notebooks/Reinforcement_Learning/q_network.pth"
+model_path = "/workspace/repos/jupyter_notebooks/Reinforcement_Learning/DQN_1.pth"
 torch.save(q_network.state_dict(), model_path)
 
 # %%
@@ -227,6 +327,8 @@ for i in range(n_episodes_eval):
             eval_returns[i] = G
             episode_done = True
 
+envs_eval.close() 
+
 # %%
 plt.hist(eval_returns)
 plt.title("Eval Returns")
@@ -237,7 +339,7 @@ plt.show();
 from IPython.display import HTML
 from base64 import b64encode
 
-mp4 = open(f'{video_path}/rl-video-episode-10.mp4', 'rb').read()
+mp4 = open(f'{video_path}/rl-video-episode-3.mp4', 'rb').read()
 data_url = "data:video/mp4;base64," + b64encode(mp4).decode()
 
 HTML("""
