@@ -1,4 +1,3 @@
-# %%
 import random
 import time
 # %pip install "gymnasium[classic-control]"
