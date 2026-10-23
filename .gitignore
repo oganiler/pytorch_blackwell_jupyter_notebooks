@@ -1,1 +1,4 @@
 *.pt
+*.pth
+karpathy/tatoeba_en_tur.txt
+Reinforcement_Learning/qlearning_cartpole_videos
