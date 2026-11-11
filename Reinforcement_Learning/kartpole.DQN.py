@@ -177,7 +177,7 @@ target_network.load_state_dict(q_network.state_dict()) # copy main to target
 
 optimizer = opt.Adam(q_network.parameters(), lr=learning_rate)
 
-rb = ReplayBuffer(envs.single_observation_space.shape[0], buffer_size)
+rb = ReplayBuffer(int(np.prod(envs.single_observation_space.shape or (1,))), buffer_size)
 
 start_time = time.time()
 for global_step in range(total_timesteps):
