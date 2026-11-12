@@ -162,13 +162,15 @@ for global_step in range(total_timesteps):
             episode_returns.append(ret)
             print(f"global_step={global_step}, episode={len(episode_returns)}, episode_return={ret}, time={time.time() - start_time:.2f}s")
 
+    # training
+    mask = np.logical_not(auto_reset) # [B] bool, from the PREVIOUS iteration
+    auto_reset = np.logical_or(terminateds, truncateds) # store for the NEXT iteration
+
     # note: if autoreset is true, next_state_obs will be s(1) for the next episode, otherwise it will be s(t+1) for the current episode
     #  we want all the states that we use in our computation to be from the same episode 
-    current_state_obs = next_state_obs
-
-    # training
-    auto_reset = np.logical_or(terminateds, truncateds)
-    mask = np.logical_not(auto_reset)
+    if not mask.any():
+        current_state_obs = next_state_obs
+        continue    
 
     # apply mask to rewards and next_state_obs to ignore the transitions that are from the next episode
     values_masked = values[mask]
@@ -210,8 +212,7 @@ for global_step in range(total_timesteps):
     # nn.utils.clip_grad_norm_(ac_network.parameters(), max_norm) # optional: clip gradients to avoid exploding gradients
     optimizer.step()
 
-    # update auto_reset to ensure that we only use the states from the same episode for the next step
-    auto_reset = np.logical_or(terminateds, truncateds)
+    current_state_obs = next_state_obs
 
     # let's break if the last 10 episode returns had the maximum return of 500, which is the maximum return for CartPole-v1
     if len(episode_returns) >= 10 and all(ret == 500 for ret in episode_returns[-10:]):
@@ -238,14 +239,14 @@ plt.show()
 
 # %%
 # save model
-model_path = "/workspace/repos/jupyter_notebooks/Reinforcement_Learning/DQN_1.pth"
-torch.save(q_network.state_dict(), model_path)
+model_path = "/workspace/repos/jupyter_notebooks/Reinforcement_Learning/A2C_1.pth"
+torch.save(ac_network.state_dict(), model_path)
 
 # %%
 # load the model for eval
 # %pip install "gymnasium[other]"
 envs_eval = gym.vector.SyncVectorEnv([lambda: make_env(env_id, True)]) # open with recording
-model = QNetwork(envs_eval).to(device)
+model = ActorCritic(envs_eval).to(device)
 model.load_state_dict(torch.load(model_path, map_location=device))
 model.eval()
 
@@ -255,22 +256,27 @@ model.eval()
 n_episodes_eval = 3
 eval_returns = np.zeros(n_episodes_eval)
 state_obs, _ = envs_eval.reset(seed=500)
-
+ 
 for i in range(n_episodes_eval):
     episode_done = False
-
+ 
     while not episode_done:
-        q_values = model(np2torch(state_obs))
-        actions = torch.argmax(q_values, dim=1).cpu().numpy()
+        # [FIX-4] the network returns (z_θ(s), V_φ(s)), not Q-values. Greedy evaluation takes the mode
+        # of the policy: a = argmax_a π_θ(a|s) = argmax_a z_θ(s)_a  (softmax is monotonic).
+        # torch.no_grad(): inference only, so no graph is recorded.
+        with torch.no_grad():
+            action_logits, _ = model(np2torch(state_obs))
+        actions = torch.argmax(action_logits, dim=1).cpu().numpy()
+        # (from the 2nd episode on, the first step() call is the NEXT_STEP reset step; its action is ignored)
         state_obs, rewards, terminateds, truncateds, infos = envs_eval.step(actions)
-
+ 
         if terminateds[0] or truncateds[0]:
             G = infos['episode']['r'][0]
             print(f"episode: {i}, return= {G}")
             eval_returns[i] = G
             episode_done = True
 
-envs_eval.close() 
+envs_eval.close()
 
 # %%
 plt.hist(eval_returns)

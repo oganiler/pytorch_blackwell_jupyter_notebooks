@@ -2,3 +2,4 @@
 *.pth
 karpathy/tatoeba_en_tur.txt
 Reinforcement_Learning/qlearning_cartpole_videos
+Reinforcement_Learning/a2c_cartpole_videos
